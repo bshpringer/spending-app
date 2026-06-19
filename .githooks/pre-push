@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# pre-push hook — refuses any push to the PUBLIC remote unless the leak audit
+# passes against the exact commit being pushed. This is the backstop for a
+# manual `git push public …` that bypasses scripts/publish-public.sh.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+#
+# Pushes to any other remote (origin) are not gated and pass straight through.
+
+set -euo pipefail
+
+REMOTE_NAME="$1"
+REMOTE_URL="$2"
+PUBLIC_REMOTE="${PUBLIC_REMOTE:-public}"
+
+# Only gate the public remote (match by configured name OR by the spending-app URL).
+if [[ "$REMOTE_NAME" != "$PUBLIC_REMOTE" && "$REMOTE_URL" != *"spending-app"* ]]; then
+  exit 0
+fi
+
+RED=$'\e[31m'; GRN=$'\e[32m'; RST=$'\e[0m'
+# Resolve the MAIN worktree, not whatever worktree triggered the push. The
+# auditor, the gitignored .publish-denylist, and data/budgeting.db all live only
+# in the primary checkout — a push originating from a throwaway publish worktree
+# would otherwise look for them there and fail-closed ("denylist not found").
+# `git worktree list` always lists the main worktree first.
+MAIN_ROOT="$(git worktree list --porcelain | awk 'NR==1 && $1=="worktree"{print $2}')"
+[[ -n "$MAIN_ROOT" ]] || MAIN_ROOT="$(git rev-parse --show-toplevel)"
+
+echo "pre-push: public remote detected — running leak audit before allowing push…"
+
+# Read the refs being pushed from stdin; audit the local commit at the tip.
+# Format per line: <local ref> <local sha> <remote ref> <remote sha>
+FAILED=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [[ "$local_sha" =~ ^0+$ ]] && continue  # branch deletion — nothing to audit
+
+  WORKTREE="$(mktemp -d)"
+  trap 'rm -rf "$WORKTREE"' EXIT
+  git worktree add -q --detach "$WORKTREE" "$local_sha"
+  # Auditor + denylist + DB all resolve from the MAIN worktree (gitignored, not
+  # in the pushed commit or a throwaway publish worktree).
+  if ! BUDGETING_DB_PATH="${BUDGETING_DB_PATH:-$MAIN_ROOT/data/budgeting.db}" \
+        node "$MAIN_ROOT/scripts/audit-public.mjs" "$WORKTREE"; then
+    FAILED=1
+  fi
+  git worktree remove -f "$WORKTREE" 2>/dev/null || true
+  rm -rf "$WORKTREE"
+done
+
+if [[ "$FAILED" -ne 0 ]]; then
+  echo "${RED}✖ pre-push: audit failed — push to public remote BLOCKED.${RST}" >&2
+  exit 1
+fi
+echo "${GRN}✓ pre-push: audit clean — allowing push to public remote.${RST}"
+exit 0
